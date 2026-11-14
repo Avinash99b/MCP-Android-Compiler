@@ -51,7 +51,7 @@ URL is assembled at runtime from `LINKPULSE_SERVER` + the `subdomain` input.
                         Remote-Shell-MCP  (127.0.0.1:8765, --no-auth)
                                           │
                               GitHub Actions runner
-                    4 vCPU / 16 GB RAM / 14 GB SSD + Android SDK/NDK
+                    4 vCPU / 16 GB RAM / 145 GB disk + Android SDK/NDK
 ```
 
 GitHub-hosted runners have **no inbound network endpoint**, so an outbound tunnel is mandatory.
@@ -120,7 +120,7 @@ close the laptop, poll `get_job` later.
 ## Android build tips
 
 ```bash
-df -h .                                     # 14 GB SSD — check before every serious build
+df -h .                                     # 145 GB, ~88 GB free — plenty of room
 java -version                               # careful: see the JDK warning below
 echo "$ANDROID_HOME" "$ANDROID_NDK_LATEST_HOME"
 export JAVA_HOME="$JAVA_HOME_17_X64"        # AGP is happiest on 17
@@ -144,7 +144,7 @@ export JAVA_HOME="$JAVA_HOME_17_X64"        # AGP is happiest on 17
 > Gradle Plugin versions do not support. Set `export JAVA_HOME="$JAVA_HOME_17_X64"` before building,
 > or pin `runs-on: ubuntu-24.04` if you need the old JDK-8/17-default image.
 
-A cold `~/.gradle` plus intermediates can exhaust 14 GB. Keep the preinstalled SDK, and consider
+A cold `~/.gradle` plus intermediates fits easily in ~88 GB of free space. Keep the preinstalled SDK, and consider
 `actions/cache` on `~/.gradle/caches` (10 GB per repo).
 
 ### Measured on a live job (not from docs)
