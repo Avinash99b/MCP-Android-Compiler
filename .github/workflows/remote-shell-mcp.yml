@@ -20,9 +20,10 @@
 #      360 minutes, so the workflow caps itself at 355.
 #
 # SECRETS (never committed - set in repo Settings > Secrets and variables > Actions)
-#   LINKPULSE_TOKEN           REQUIRED  shared secret from ~/.config/linkpulse/authtoken.json
-#   LINKPULSE_SERVER          optional  control server host:port
-#                                       (default: <linkpulse-host>:9000)
+#   LINKPULSE_TOKEN           REQUIRED  shared secret of the LinkPulse control server
+#   LINKPULSE_SERVER          REQUIRED  control server as host:port, e.g. tunnel.example.com:9000
+#                                       The public domain is derived from the host part, so no
+#                                       hostname is ever committed to this repository.
 #   MACRODROID_WEBHOOK_URL    optional  phone notifications for the URL
 #
 # SECURITY NOTE (deliberate, per owner's request): the MCP endpoint is exposed
@@ -82,14 +83,18 @@ jobs:
           set -euo pipefail
           mkdir -p ws && cd ws
 
-          if [ -z "${LINKPULSE_TOKEN:-}" ]; then
-            echo "::error::Secret LINKPULSE_TOKEN is not set. Add it under Settings > Secrets and variables > Actions."
+          missing=""
+          [ -z "${LINKPULSE_SERVER:-}" ] && missing="$missing LINKPULSE_SERVER"
+          [ -z "${LINKPULSE_TOKEN:-}"  ] && missing="$missing LINKPULSE_TOKEN"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secret(s):$missing - add under Settings > Secrets and variables > Actions."
             exit 1
           fi
 
           # --- server/domain resolution -------------------------------------
-          SERVER="${LINKPULSE_SERVER:-<linkpulse-host>:9000}"
-          DOMAIN="${SERVER%%:*}"                    # <linkpulse-host>
+          SERVER="$LINKPULSE_SERVER"
+          case "$SERVER" in *:*) ;; *) SERVER="${SERVER}:9000" ;; esac   # default control port
+          DOMAIN="${SERVER%%:*}"                    # public domain, derived - never hardcoded
           SUB="${SUB_INPUT:-mcp-android-compiler}"
           PUBLIC_URL="https://${SUB}.${DOMAIN}"
           echo "control server : $SERVER"

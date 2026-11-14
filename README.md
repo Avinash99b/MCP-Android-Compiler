@@ -23,23 +23,24 @@ Set these in **Settings → Secrets and variables → Actions**. Nothing secret 
 
 | Secret | Required | Value |
 |---|---|---|
-| `LINKPULSE_TOKEN` | **yes** | The shared secret from `~/.config/linkpulse/authtoken.json` (`"token"` field) |
-| `LINKPULSE_SERVER` | no | Control server `host:port`. Default `<linkpulse-host>:9000` |
+| `LINKPULSE_TOKEN` | **yes** | Shared secret of the LinkPulse control server |
+| `LINKPULSE_SERVER` | **yes** | Control server as `host:port`, e.g. `tunnel.example.com:9000`. The public domain is derived from the host part, so no hostname is committed here. |
 | `MACRODROID_WEBHOOK_URL` | no | MacroDroid trigger URL; receives the public URL when the runner is ready |
 
 ```bash
-# set them (paste the token when prompted - it is never echoed)
+# both are required; the token is never echoed
 gh secret set LINKPULSE_TOKEN  --repo Avinash99b/MCP-Android-Compiler
-gh secret set LINKPULSE_SERVER --repo Avinash99b/MCP-Android-Compiler --body '<linkpulse-host>:9000'
-gh secret set MACRODROID_WEBHOOK_URL --repo Avinash99b/MCP-Android-Compiler
+gh secret set LINKPULSE_SERVER --repo Avinash99b/MCP-Android-Compiler   # paste host:port
+gh secret set MACRODROID_WEBHOOK_URL --repo Avinash99b/MCP-Android-Compiler   # optional
 ```
 
-You do **not** need `LINKPULSE_SERVER` — it defaults in the workflow.
+No hostname, URL, token or key is stored in this repository — only the `subdomain` label. The public
+URL is assembled at runtime from `LINKPULSE_SERVER` + the `subdomain` input.
 
 ## How it works
 
 ```
- your MCP client  ──HTTPS──►  https://<subdomain>.<linkpulse-host>/mcp
+ your MCP client  ──HTTPS──►  https://<subdomain>.<your-linkpulse-domain>/mcp
                                           │
                         LinkPulse public edge (your own server)
                                           │
@@ -61,7 +62,7 @@ config does not change between runs.
 
 1. **Actions → remote-shell-mcp → Run workflow**
    - `duration_minutes` — how long to keep the runner (max 350; GitHub kills hosted jobs at 360)
-   - `subdomain` — default `mcp-android-compiler` → `https://mcp-android-compiler.<your-domain>`
+   - `subdomain` — default `mcp-android-compiler` → `https://mcp-android-compiler.<your-linkpulse-domain>`
    - `notify_phone` — push the URL to your phone
 2. The workflow verifies the **public** endpoint with a real MCP `initialize` before declaring
    success, then idles.
@@ -72,7 +73,7 @@ config does not change between runs.
   "mcpServers": {
     "actions-runner": {
       "type": "http",
-      "url": "https://mcp-android-compiler.<linkpulse-host>/mcp"
+      "url": "https://mcp-android-compiler.<your-linkpulse-domain>/mcp"
     }
   }
 }
@@ -83,7 +84,7 @@ No auth header — `--no-auth` is intentional.
 Smoke test:
 
 ```bash
-curl -sS -X POST https://mcp-android-compiler.<linkpulse-host>/mcp \
+curl -sS -X POST https://mcp-android-compiler.<your-linkpulse-domain>/mcp \
   -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"cli","version":"1"}}}'
