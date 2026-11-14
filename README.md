@@ -147,12 +147,30 @@ export JAVA_HOME="$JAVA_HOME_17_X64"        # AGP is happiest on 17
 A cold `~/.gradle` plus intermediates can exhaust 14 GB. Keep the preinstalled SDK, and consider
 `actions/cache` on `~/.gradle/caches` (10 GB per repo).
 
+### Measured on a live job (not from docs)
+
+Verified by driving a running job over MCP on 2026-11-14 (run `43610118300`):
+
+| | |
+|---|---|
+| OS | **Ubuntu 26.04.1 LTS** (`ubuntu-latest` is no longer 24.04) |
+| CPU / RAM | 4 vCPU / ~15.6 GiB |
+| Disk | **145 GB total, ~88 GB free** — the docs' "14 GB SSD" is outdated |
+| `/dev/kvm` | **present** → Android emulator hardware acceleration works |
+| Default JDK | **25** (11/17/21 also installed; JDK 8 is gone) |
+| Gradle | 9.9.1 |
+| `ANDROID_HOME` | `/usr/local/lib/android/sdk`, platforms through `android-37.2` |
+| User | `runner`, passwordless `sudo` |
+
+Because `/dev/kvm` is available, instrumented tests (`connectedAndroidTest`) are viable here — not just
+`assembleDebug`.
+
 ## Limits
 
 | Limit | Value |
 |---|---|
 | Job wall-clock | **6 h hard cap** (workflow uses 355 min) |
-| Runner | 4 vCPU / 16 GB RAM / 14 GB SSD, fresh VM per job |
+| Runner | 4 vCPU / ~16 GB RAM / **145 GB disk (~88 GB free, measured)**, fresh VM per job |
 | Persistence | **None** — disk, caches, working tree destroyed at job end |
 | Inbound networking | **None** — tunnel required |
 | Artifacts | 500 MB on GitHub Free |
