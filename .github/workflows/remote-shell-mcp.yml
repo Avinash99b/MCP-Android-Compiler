@@ -1,0 +1,173 @@
+# ---------------------------------------------------------------------------
+# Temporary remote MCP shell on a GitHub-hosted runner
+#
+# Repo:  github.com/Avinash99b/MCP-Android-Compiler
+# Serve: github.com/Avinash99b/Remote-Shell-MCP  (mcp_shell_server.py, cloned at runtime)
+#
+# FLOW
+#   1. A GitHub-hosted runner starts: Linux 4 vCPU / 16 GB RAM / 14 GB SSD (x64).
+#      On PUBLIC repos, standard runner minutes are free and unlimited.
+#   2. cloudflared opens an OUTBOUND-only quick tunnel to 127.0.0.1:8765.
+#      REQUIRED: GitHub-hosted runners have NO inbound endpoint whatsoever.
+#   3. Remote-Shell-MCP is started bound to 127.0.0.1 with a random bearer token,
+#      and the tunnel hostname on its Host-header allowlist. Without
+#      --allowed-host the server answers HTTP 421 "Invalid Host header" to
+#      every tunnelled request (verified during testing).
+#   4. The tunnel URL + token are pushed to your phone (MacroDroid webhook) and
+#      written to the job summary.
+#   5. The job stays alive for `duration_minutes`. GitHub hard-kills hosted jobs
+#      at 360 minutes, so the cap here is 350.
+#
+# COMPLIANCE NOTE (GitHub Terms for Additional Products and Features):
+#   GitHub-hosted runners may not be used for "any other activity unrelated to
+#   the production, testing, deployment, or publication of the software project
+#   associated with the repository where GitHub Actions are used."
+#   This repository exists specifically as the project for this workload, so
+#   keep the Android sources you compile IN THIS REPOSITORY (see README).
+# ---------------------------------------------------------------------------
+
+name: remote-shell-mcp
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "Minutes to keep the runner alive (max 350; GitHub kills hosted jobs at 360)"
+        required: true
+        default: "120"
+      notify_phone:
+        description: "Send the tunnel URL + token to the MacroDroid webhook"
+        type: boolean
+        default: true
+
+# One runner at a time: a single stable URL, and no concurrency burn.
+concurrency:
+  group: remote-shell-mcp
+  cancel-in-progress: false
+
+# The exposed shell can read GITHUB_TOKEN, so hand it nothing.
+permissions: {}
+
+jobs:
+  serve:
+    runs-on: ubuntu-latest        # ubuntu-slim is a 1-CPU unprivileged container with a
+                                  # minimal image: not suitable for this or any heavy build.
+    timeout-minutes: 355          # < the 360-minute hard limit for GitHub-hosted jobs
+
+    steps:
+      # Guarantees a working `python3 -m venv` / ensurepip regardless of image changes.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Start remote shell + tunnel
+        id: tunnel
+        env:
+          NOTIFY: ${{ inputs.notify_phone }}
+          WEBHOOK: ${{ secrets.MACRODROID_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+          mkdir -p ws && cd ws
+
+          # --- fetch the MCP shell server (public repo, no auth needed) ---
+          git clone --depth 1 https://github.com/Avinash99b/Remote-Shell-MCP.git server
+          python3 -m venv .venv
+          ./.venv/bin/pip install --quiet --disable-pip-version-check -r server/requirements.txt
+
+          # --- auth token: random, never printed ---
+          MCP_TOKEN="$(openssl rand -hex 24)"
+          echo "::add-mask::$MCP_TOKEN"
+          echo "MCP_TOKEN=$MCP_TOKEN" >> "$GITHUB_ENV"
+
+          # --- outbound-only tunnel ---
+          curl -fsSL -o cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared
+          nohup ./cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8765 > cf.log 2>&1 &
+
+          URL=""
+          for _ in $(seq 1 60); do
+            URL="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' cf.log | head -1 || true)"
+            [ -n "$URL" ] && break
+            sleep 2
+          done
+          if [ -z "$URL" ]; then echo "tunnel failed to provision:"; tail -40 cf.log; exit 1; fi
+          HOST="${URL#https://}"
+          echo "url=$URL"   >> "$GITHUB_OUTPUT"
+          echo "host=$HOST" >> "$GITHUB_OUTPUT"
+
+          # --- MCP server (localhost-only bind + Host allowlist) ---
+          nohup ./.venv/bin/python server/mcp_shell_server.py \
+            --host 127.0.0.1 --port 8765 \
+            --token "$MCP_TOKEN" \
+            --allowed-host "$HOST" \
+            --cwd "$PWD" \
+            --log-level info > server.log 2>&1 &
+          echo $! > server.pid
+          sleep 3
+
+          kill -0 "$(cat server.pid)" 2>/dev/null || { echo "server died at startup:"; tail -40 server.log; exit 1; }
+          echo "--- local handshake check ---"
+          curl -s -o /dev/null -w "local initialize -> HTTP %{http_code}\n" \
+            -X POST http://127.0.0.1:8765/mcp \
+            -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+            -H "Authorization: Bearer $MCP_TOKEN" \
+            -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"wf","version":"1"}}}'
+
+          {
+            echo "## Remote MCP shell is up"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| MCP endpoint | \`$URL/mcp\` |"
+            echo "| Auth | \`Authorization: Bearer <MCP_TOKEN>\` |"
+            echo "| Runner | $(nproc) vCPU / $(free -g | awk '/Mem:/{print $2}') GB RAM |"
+            echo "| Disk | $(df -h . | awk 'NR==2{print $2" total, "$4" free"}') |"
+            echo "| JDK | $(java -version 2>&1 | head -1) |"
+            echo "| Gradle | $(gradle -v 2>/dev/null | awk '/^Gradle /{print $2; exit}') |"
+            echo "| Android SDK | \`${ANDROID_HOME:-unset}\` |"
+            echo "| Android NDK | \`${ANDROID_NDK_LATEST_HOME:-unset}\` |"
+            echo
+            echo "The token is masked in all logs and was pushed to your phone."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$NOTIFY" = "true" ] && [ -n "${WEBHOOK:-}" ]; then
+            curl -sf --max-time 10 -X POST "$WEBHOOK" \
+              -H 'Content-Type: application/json' \
+              --data "$(printf '{"description":"Actions runner READY - MCP: %s/mcp token: %s"}' "$URL" "$MCP_TOKEN")" \
+              || echo "webhook notification failed (continuing)"
+          fi
+
+      - name: Show Android toolchain
+        run: |
+          echo "cores=$(nproc)  ram=$(free -g | awk '/Mem:/{print $2}')GB"
+          df -h . | tail -1
+          (java -version 2>&1 | head -2) || true
+          echo "ANDROID_HOME=${ANDROID_HOME:-unset}"
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-unset}"
+          echo "ANDROID_NDK_LATEST_HOME=${ANDROID_NDK_LATEST_HOME:-unset}"
+          (gradle -v 2>/dev/null | awk '/^Gradle /{print; exit}') || true
+          ls "${ANDROID_HOME:-/nonexistent}/platforms" 2>/dev/null | tail -8 || true
+
+      - name: Keep the runner alive
+        env:
+          MINUTES: ${{ inputs.duration_minutes }}
+        run: |
+          set -euo pipefail
+          END=$(( $(date +%s) + MINUTES * 60 ))
+          while [ "$(date +%s)" -lt "$END" ]; do
+            kill -0 "$(cat ws/server.pid)" 2>/dev/null || { echo "server died:"; tail -40 ws/server.log; exit 1; }
+            sleep 30
+          done
+          echo "duration reached; shutting down"
+
+      - name: Upload server and tunnel logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: remote-shell-mcp-logs
+          path: |
+            ws/server.log
+            ws/cf.log
+          if-no-files-found: ignore
+          retention-days: 1
