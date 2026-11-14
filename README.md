@@ -11,6 +11,12 @@ session (`initialize` → `tools/list` → `tools/call run_shell_command`) and e
 remote host. The LinkPulse path used here was also verified separately — env-var auth, tunnel
 registration, live public fetch, and teardown.
 
+On top of that, **this workflow has already run for real**: job `132484064233`
+(run `43607121046`) cloned the server, started it on the runner and logged
+`local initialize -> HTTP 200`. Both tunnel backends have therefore been exercised on an actual
+GitHub-hosted runner — the LinkPulse version additionally verifies the *public* URL before reporting
+success.
+
 ## Required secrets
 
 Set these in **Settings → Secrets and variables → Actions**. Nothing secret lives in this repo.
@@ -114,14 +120,28 @@ close the laptop, poll `get_job` later.
 
 ```bash
 df -h .                                     # 14 GB SSD — check before every serious build
-java -version                               # JDK 17 default; 8/11/21/25 also installed
+java -version                               # careful: see the JDK warning below
 echo "$ANDROID_HOME" "$ANDROID_NDK_LATEST_HOME"
+export JAVA_HOME="$JAVA_HOME_17_X64"        # AGP is happiest on 17
 ./gradlew :app:assembleDebug --no-daemon    # --no-daemon is usually faster in a one-shot VM
 ```
 
-Preinstalled on `ubuntu-latest`: Android cmdline-tools 12.0, build-tools 34–37, platforms
-android-34 → android-37.2, NDK 27.3 / 29.0 / 30.0, Gradle 9.9.1, JDK 8/11/17/21/25, plus KVM
-hardware acceleration for the emulator. Most builds need **no SDK download**.
+**Toolchain actually on `ubuntu-latest` today** (verified against a real run on 2026-11-14, image
+`ubuntu26 / 20261111.196.1` — `ubuntu-latest` is now **Ubuntu 26.04**, no longer 24.04):
+
+| | |
+|---|---|
+| Android cmdline-tools | 20.0 |
+| Build-tools | 37.0.0 / 36.0.0 / 36.1.0 / 35.0.0 / 35.0.1 / 34.0.0 |
+| Platforms | android-34 → android-37.2 (incl. beta) |
+| NDK | 27.3.13750724 (default) · 29.0.14206865 · 30.0.16248370 |
+| Gradle | 9.9.1 |
+| JDK | **11, 17, 21, 25 — 25 is the DEFAULT, and JDK 8 is gone** |
+| CMake | 3.31.5 / 4.1.2 |
+
+> ⚠️ **JDK warning.** The default `java` on `ubuntu-latest` is now **25**, which many Android
+> Gradle Plugin versions do not support. Set `export JAVA_HOME="$JAVA_HOME_17_X64"` before building,
+> or pin `runs-on: ubuntu-24.04` if you need the old JDK-8/17-default image.
 
 A cold `~/.gradle` plus intermediates can exhaust 14 GB. Keep the preinstalled SDK, and consider
 `actions/cache` on `~/.gradle/caches` (10 GB per repo).
