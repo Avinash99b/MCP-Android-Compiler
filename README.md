@@ -48,7 +48,7 @@ URL is assembled at runtime from `LINKPULSE_SERVER` + the `subdomain` input.
                                           │
                         multiplexed, authenticated control connection (:9000)
                                           │
-                        my_proxy client  (on the runner, outbound only)
+             linkpulse client  (/usr/local/bin/linkpulse, outbound only)
                                           │
                         Remote-Shell-MCP  (127.0.0.1:8765, --no-auth)
                                           │
@@ -110,6 +110,57 @@ close the laptop, poll `get_job` later.
 > the runner authenticates over SSH, and `permissions: {}` still means the shell never holds a
 > GitHub *token*. If you would rather push with a token instead, add `contents: write` to the
 > workflow and the `GITHUB_TOKEN` becomes usable - but then the no-auth shell holds that too.
+
+## LinkPulse on `PATH` (system-wide)
+
+The client is installed **system-wide** at `/usr/local/bin/linkpulse` by the workflow step
+**Install LinkPulse system-wide** — before anything opens a network connection, and before the
+tunnel step runs. Nothing downloads it at point of use any more, so:
+
+- the workflow's tunnel and any tunnel you open by hand from the shell are the *same binary*;
+- `linkpulse` just works from any directory, in any later step, in any shell session;
+- an upgrade happens in exactly one place (`env:` at the top of the workflow).
+
+Integrity: the hash is pinned as `LINKPULSE_SHA256` next to `LINKPULSE_VERSION` and checked before
+install. It is deliberately **not** read from the release's own `CHECKSUMS.sha256` — a checksum that
+travels inside the artefact it describes catches corruption but never tampering. A mismatch is
+fatal (a tampered binary is not something to "degrade gracefully" over); a missing pin is a warning,
+so a version bump can't brick a run by omission. The step is idempotent: if the installed binary
+already matches the pin, the download is skipped. It also sanity-checks the ELF magic, because a
+proxy/HTML error page saved as "the binary" is a classic CI failure.
+
+To bump the version, change **both** lines together:
+
+```yaml
+LINKPULSE_VERSION: v1.0.0
+LINKPULSE_SHA256: fcd16cb86d454adb75a94913651f6d09def3abd33252875ebee659512114ab3b
+```
+
+> ⚠️ v0.1.4 is pinned on purpose. v1.0.0 exists and its published checksum verifies, but its
+> `--lease` flag defaults **off** — "handoff mode" — so a second client would silently *take over*
+> the fixed subdomain instead of failing with `subdomain '...' is already in use`. The tunnel
+> retry/collision handling below greps for that exact string, so that logic needs revisiting before
+> bumping.
+
+### Handing a file to someone from inside the shell
+
+`MY_PROXY_SERVER` and `MY_PROXY_TOKEN` are exported by the tunnel step, so the MCP shell session
+already has working credentials — no re-auth needed:
+
+```bash
+mkdir -p /tmp/share && cp artifact.zip /tmp/share/
+(cd /tmp/share && nohup python3 -m http.server 8080 --bind 127.0.0.1 > /tmp/httpd.log 2>&1 &)
+nohup linkpulse http 8080 --no-dashboard > /tmp/lp.log 2>&1 &
+sleep 10
+URL="$(grep -oE 'https://[a-z0-9.-]+' /tmp/lp.log | head -1)"
+echo "$URL/artifact.zip"
+curl -s --max-time 60 -o /tmp/dl.zip "$URL/artifact.zip" && sha256sum artifact.zip /tmp/dl.zip   # must match
+```
+
+- Omit `-u` so LinkPulse assigns a **random** subdomain. Reusing `-u mcp-android-compiler` would
+  fight the workflow's own lease over the MCP endpoint.
+- A successful `curl` proves routing, not integrity — compare the two `sha256sum`s.
+- Clean up with `pgrep -af "linkpulse http 8080"` then `kill <pids>`; a dead tunnel answers **404**.
 
 ## GitHub credentials inside the shell (SSH)
 

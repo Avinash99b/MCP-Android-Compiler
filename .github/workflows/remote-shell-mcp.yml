@@ -6,10 +6,17 @@
 # Tunnel: github.com/Avinash99b/LinkPulse          (my_proxy client) - NOT cloudflare
 #
 # FLOW
-#   0. If SSH_PRIVATE_KEY is set it is written to ~/.ssh, github.com host keys are pinned
-#      from api.github.com/meta, the key is proven with a real `ssh -T git@github.com`, and
-#      (optionally) https://github.com/ remotes are rewritten to SSH. Never fatal: without a
-#      working key the job continues over HTTPS.
+#   0. The runner prepares itself before anything opens a network connection:
+#      a) The LinkPulse client is installed SYSTEM-WIDE at /usr/local/bin/linkpulse,
+#         checksum-verified against the pinned LINKPULSE_SHA256 in `env` below. No
+#         step downloads it any more, and the interactive shell gets the same
+#         binary at the same path - so a tunnel you open by hand can never be a
+#         different version from the one this workflow relies on.
+#      b) If SSH_PRIVATE_KEY is set it is written to ~/.ssh, github.com host keys
+#         are pinned from api.github.com/meta, the key is proven with a real
+#         `ssh -T git@github.com`, and (optionally) https://github.com/ remotes
+#         are rewritten to SSH. Never fatal: without a working key the job
+#         continues over HTTPS.
 #   1. Runner starts: Linux 4 vCPU / 16 GB RAM / 14 GB SSD. Free + unlimited
 #      minutes on PUBLIC repositories.
 #   2. Remote-Shell-MCP is started on 127.0.0.1:8765 with `--no-auth`
@@ -75,7 +82,24 @@ concurrency:
 permissions: {}
 
 env:
-  LINKPULSE_VERSION: v0.1.4      # latest release of Avinash99b/LinkPulse
+  # ---------------------------------------------------------------------------
+  # LinkPulse client - installed SYSTEM-WIDE as /usr/local/bin/linkpulse by the
+  # first custom step, so later steps and the interactive MCP shell session can
+  # simply call `linkpulse` (no relative path, no per-step download).
+  #
+  # Bump LINKPULSE_VERSION and LINKPULSE_SHA256 TOGETHER. The hash is pinned here
+  # rather than read from the release, because a checksum shipped inside the
+  # artefact it describes only catches corruption, never tampering.
+  #   v0.1.4   7995608 B   <- pinned; what every successful run so far used
+  #   v1.0.0   8044176 B   <- newer, but its default is `--lease` OFF (handoff
+  #                           mode), which would silently TAKE OVER the fixed
+  #                           subdomain instead of failing with "already in use".
+  #                           The collision handling below greps for that string,
+  #                           so revisit it before bumping.  sha256:
+  #                           fcd16cb86d454adb75a94913651f6d09def3abd33252875ebee659512114ab3b
+  # ---------------------------------------------------------------------------
+  LINKPULSE_VERSION: v0.1.4
+  LINKPULSE_SHA256: c264cdc0ead280ae51fdd46d1c30d7a2e810e1a29ee3eeb1052ad06794f7d3c9
   MCP_PORT: "8765"
 
 jobs:
@@ -87,6 +111,106 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Install LinkPulse system-wide
+        id: linkpulse
+        run: |
+          #!/usr/bin/env bash
+          # ---------------------------------------------------------------------------
+          # Installs the LinkPulse client (my_proxy) SYSTEM-WIDE as /usr/local/bin/linkpulse,
+          # so every later workflow step AND the interactive MCP shell session can just call
+          # `linkpulse` - no relative path, no per-step download, no version drift between
+          # the tunnel the workflow opens and the tunnels you open by hand from the shell.
+          #
+          # Integrity is checked against a SHA-256 PINNED IN THIS WORKFLOW, not against a
+          # checksum file served by the same release it is meant to protect: a checksum that
+          # travels with the artefact only detects corruption, never tampering.
+          # ---------------------------------------------------------------------------
+          set -euo pipefail
+
+          DEST="${LINKPULSE_DEST:-/usr/local/bin/linkpulse}"
+          ASSET="my_proxy-linux-amd64"
+          URL="https://github.com/Avinash99b/LinkPulse/releases/download/${LINKPULSE_VERSION}/${ASSET}"
+
+          # sudo only when needed - the hosted runner is non-root, a root container is not.
+          SUDO=()
+          [ "$(id -u)" -ne 0 ] && SUDO=(sudo)
+
+          echo "release : ${LINKPULSE_VERSION}"
+          echo "asset   : ${ASSET}"
+          echo "target  : ${DEST}"
+
+          SKIPPED=false
+          if [ -x "$DEST" ] && [ -n "${LINKPULSE_SHA256:-}" ] \
+             && printf '%s  %s\n' "$LINKPULSE_SHA256" "$DEST" | sha256sum -c --status 2>/dev/null; then
+            SKIPPED=true
+            echo "${DEST} is already installed and matches the pinned checksum - skipping download"
+          fi
+
+          if [ "$SKIPPED" != true ]; then
+            TMP="$(mktemp -d)"
+            trap 'rm -rf "$TMP"' EXIT
+
+            curl -fsSL --retry 3 --retry-delay 2 --max-time 180 -o "$TMP/$ASSET" "$URL"
+            echo "downloaded: $(stat -c%s "$TMP/$ASSET") bytes"
+
+            # --- integrity ----------------------------------------------------------
+            ACTUAL="$(sha256sum "$TMP/$ASSET" | awk '{print $1}')"
+            echo "sha256  : $ACTUAL"
+            if [ -z "${LINKPULSE_SHA256:-}" ]; then
+              printf '::warning::LINKPULSE_SHA256 is not set - installing %s WITHOUT integrity verification. Pin the hash in this workflow.\n' "$LINKPULSE_VERSION"
+            elif [ "$ACTUAL" != "$LINKPULSE_SHA256" ]; then
+              printf '::error::Checksum mismatch for %s (%s) - refusing to install.\n  expected: %s\n  actual  : %s\nIf you bumped LINKPULSE_VERSION, update LINKPULSE_SHA256 in this workflow to the hash of the new asset.\n' \
+                "$ASSET" "$LINKPULSE_VERSION" "$LINKPULSE_SHA256" "$ACTUAL"
+              exit 1
+            else
+              echo "checksum verified against the pinned LINKPULSE_SHA256"
+            fi
+
+            # --- sanity: a real x86-64 ELF, not an HTML error page ------------------
+            MAGIC="$(head -c 4 "$TMP/$ASSET" | od -An -tx1 | tr -d ' \n')"
+            if [ "$MAGIC" != "7f454c46" ]; then
+              echo "::error::$ASSET is not an ELF binary (magic=$MAGIC); first bytes follow:"
+              head -c 200 "$TMP/$ASSET" || true
+              exit 1
+            fi
+            echo "ELF magic ok"
+
+            # /usr/local/bin is on the runner's default PATH (root-owned normally; on this
+            # image it is 0777, but sudo install works either way).
+            "${SUDO[@]}" install -d -m 0755 "$(dirname "$DEST")"
+            "${SUDO[@]}" install -m 0755 -o root -g root "$TMP/$ASSET" "$DEST"
+            echo "installed: $(ls -l "$DEST")"
+          fi
+
+          # --- prove it resolves and runs from a directory unrelated to it -----------
+          cd /
+          BIN="$(command -v linkpulse || true)"
+          if [ -z "$BIN" ]; then
+            echo "::error::$DEST was installed but is not on PATH (PATH=$PATH)"
+            exit 1
+          fi
+          if ! linkpulse --help >/dev/null 2>&1; then
+            echo "::error::linkpulse resolves to $BIN but 'linkpulse --help' fails"
+            exit 1
+          fi
+          echo "linkpulse resolves on PATH to $BIN and runs"
+
+          {
+            echo "LINKPULSE_BIN=$BIN"
+            echo "LINKPULSE_INSTALLED_VERSION=${LINKPULSE_VERSION}"
+          } >> "$GITHUB_ENV"
+
+          {
+            echo "### LinkPulse installed system-wide"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| binary | \`${BIN}\` |"
+            echo "| release | ${LINKPULSE_VERSION} |"
+            echo "| sha256 | \`${LINKPULSE_SHA256:-unverified}\` |"
+            echo "| available to the shell | yes - \`linkpulse\` on PATH |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Install GitHub SSH key (optional)
         id: ssh
@@ -313,10 +437,19 @@ jobs:
           echo "public_url=$PUBLIC_URL" >> "$GITHUB_OUTPUT"
 
           # --- LinkPulse client ---------------------------------------------
-          curl -fsSL -o linkpulse \
-            "https://github.com/Avinash99b/LinkPulse/releases/download/${LINKPULSE_VERSION}/my_proxy-linux-amd64"
-          chmod +x linkpulse
-          ./linkpulse --help >/dev/null   # fail fast if the binary is unusable
+          # Installed system-wide by the "Install LinkPulse system-wide" step; nothing
+          # is downloaded here any more. Resolve it from PATH so the tunnel this step
+          # opens and any tunnel opened by hand in the MCP shell are the same binary.
+          LINKPULSE_BIN="${LINKPULSE_BIN:-$(command -v linkpulse || true)}"
+          if [ -z "${LINKPULSE_BIN:-}" ] || [ ! -x "$LINKPULSE_BIN" ]; then
+            echo "::error::linkpulse not found on PATH - the install step did not run or failed."
+            exit 1
+          fi
+          if ! "$LINKPULSE_BIN" --help >/dev/null 2>&1; then
+            echo "::error::$LINKPULSE_BIN exists but is not runnable."
+            exit 1
+          fi
+          echo "using LinkPulse: $LINKPULSE_BIN"
           export MY_PROXY_SERVER="$SERVER"
           export MY_PROXY_TOKEN="$LINKPULSE_TOKEN"
 
@@ -358,7 +491,7 @@ jobs:
           READY=0
           for attempt in 1 2 3; do
             : > linkpulse.log
-            nohup ./linkpulse http "$MCP_PORT" \
+            nohup "$LINKPULSE_BIN" http "$MCP_PORT" \
               -u "$SUB" --no-dashboard --log-level INFO > linkpulse.log 2>&1 &
             echo $! > linkpulse.pid
             for _ in $(seq 1 30); do
@@ -411,7 +544,7 @@ jobs:
             echo "|---|---|"
             echo "| MCP endpoint | \`${PUBLIC_URL}/mcp\` |"
             echo "| Auth | **none** (\`--no-auth\`) |"
-            echo "| Tunnel | LinkPulse ${LINKPULSE_VERSION} -> \`${SERVER}\` |"
+            echo "| Tunnel | LinkPulse ${LINKPULSE_INSTALLED_VERSION:-$LINKPULSE_VERSION} (\`${LINKPULSE_BIN:-linkpulse}\`) -> \`${SERVER}\` |"
             echo "| Subdomain | \`${SUB}\` |"
             echo "| GitHub SSH | \`${SSH_LOGIN:-none}\` key-ready: \`${SSH_KEY_READY:-false}\` https->ssh: \`${SSH_REWRITE:-false}\` |"
             echo "| Runner | $(nproc) vCPU / $(free -g | awk '/Mem:/{print $2}') GB RAM |"
