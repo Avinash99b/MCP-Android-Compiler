@@ -6,6 +6,10 @@
 # Tunnel: github.com/Avinash99b/LinkPulse          (my_proxy client) - NOT cloudflare
 #
 # FLOW
+#   0. If SSH_PRIVATE_KEY is set it is written to ~/.ssh, github.com host keys are pinned
+#      from api.github.com/meta, the key is proven with a real `ssh -T git@github.com`, and
+#      (optionally) https://github.com/ remotes are rewritten to SSH. Never fatal: without a
+#      working key the job continues over HTTPS.
 #   1. Runner starts: Linux 4 vCPU / 16 GB RAM / 14 GB SSD. Free + unlimited
 #      minutes on PUBLIC repositories.
 #   2. Remote-Shell-MCP is started on 127.0.0.1:8765 with `--no-auth`
@@ -25,10 +29,19 @@
 #                                       The public domain is derived from the host part, so no
 #                                       hostname is ever committed to this repository.
 #   MACRODROID_WEBHOOK_URL    optional  phone notifications for the URL
+#   SSH_PRIVATE_KEY           optional  OpenSSH/PEM private key installed into the runner's
+#                                       ~/.ssh, so this workflow and the interactive shell
+#                                       authenticate to GitHub over SSH (git@github.com:).
+#                                       Must be UNENCRYPTED - there is no way to type a
+#                                       passphrase non-interactively on a hosted runner.
 #
 # SECURITY NOTE (deliberate, per owner's request): the MCP endpoint is exposed
 # WITHOUT authentication on a FIXED, guessable hostname. Anyone who knows the
 # URL gets a shell on the runner. Keep sessions short and delete run logs.
+#
+# Now that this workflow can also install SSH_PRIVATE_KEY, that shell additionally holds
+# whatever that key can reach on GitHub - a strictly larger blast radius than before.
+# Use a key dedicated to this job (not your primary identity) and rotate it.
 # ---------------------------------------------------------------------------
 
 name: remote-shell-mcp
@@ -46,6 +59,10 @@ on:
         default: "mcp-android-compiler"
       notify_phone:
         description: "Send the public URL to the MacroDroid webhook"
+        type: boolean
+        default: true
+      git_ssh_rewrite:
+        description: "Rewrite https://github.com/ remotes to git@github.com: so every git command in the shell uses SSH_PRIVATE_KEY. Ignored when no key is installed."
         type: boolean
         default: true
 
@@ -70,6 +87,185 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Install GitHub SSH key (optional)
+        id: ssh
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          REWRITE: ${{ inputs.git_ssh_rewrite }}
+        run: |
+          #!/usr/bin/env bash
+          # ---------------------------------------------------------------------------
+          # Installs the GitHub SSH private key (repo secret SSH_PRIVATE_KEY) into the
+          # runner's ~/.ssh, so this workflow's own clones AND the whole MCP shell session
+          # can talk to GitHub over SSH - no PAT, no `contents: write` token scope.
+          # Never fatal: a missing/broken key degrades to HTTPS-only instead of costing a run.
+          # ---------------------------------------------------------------------------
+          set -uo pipefail
+
+          KEY_READY=false
+          KEY_REASON="SSH_PRIVATE_KEY is not set (optional secret)"
+          LOGIN=""; KEY_NAME=""; KEY_TYPE=""; KEY_FP=""; KEY_ENC=""; HOST_KEYS_SRC="unavailable"
+          REWRITE_EFFECTIVE="${REWRITE:-false}"
+          KEY_DISPLAY="n/a"
+
+          if [ -z "${SSH_PRIVATE_KEY:-}" ]; then
+            printf '::warning::%s - the shell will have no GitHub SSH credential (HTTPS/anonymous only).\n' "$KEY_REASON"
+          else
+            install -d -m 700 "$HOME/.ssh"; chmod 700 "$HOME/.ssh"
+
+            # A secret pasted from a phone often arrives as ONE line with literal \n
+            # separators, CRLF endings, or wrapped in quotes. Normalise first.
+            if ! python3 - <<'PY'
+          import os, pathlib
+          raw = os.environ.get("SSH_PRIVATE_KEY", "")
+          if "\n" not in raw and "\\n" in raw:
+              raw = raw.replace("\\r", "").replace("\\n", "\n")
+          raw = raw.replace("\r\n", "\n").replace("\r", "\n").strip()
+          if len(raw) > 1 and raw[0] == raw[-1] == '"':
+              raw = raw[1:-1]
+          p = pathlib.Path.home() / ".ssh" / "staged_key"
+          p.write_text(raw + "\n")
+          p.chmod(0o600)
+          print("staged %d bytes of key material" % (len(raw) + 1))
+          PY
+            then
+              KEY_REASON="could not normalise the secret"
+              printf '::error::SSH_PRIVATE_KEY %s.\n' "$KEY_REASON"
+            fi
+
+            STAGED="$HOME/.ssh/staged_key"
+            if [ ! -f "$STAGED" ]; then
+              :
+            elif ! grep -q -- 'PRIVATE KEY-----' "$STAGED"; then
+              rm -f "$STAGED"
+              KEY_REASON="the secret does not contain a PEM/OpenSSH private-key block (did you paste the .pub by mistake?)"
+              printf '::error::SSH_PRIVATE_KEY %s - GitHub SSH auth stays OFF.\n' "$KEY_REASON"
+            else
+              # OpenSSH-format keys embed their public half, so -lf works even for a
+              # passphrase-protected key; `-y -P ''` does not, and is how we detect one.
+              KEY_FP_LINE="$(ssh-keygen -lf "$STAGED" 2>/dev/null)"
+              if [ -z "$KEY_FP_LINE" ]; then
+                rm -f "$STAGED"
+                KEY_REASON="ssh-keygen could not parse the key (corrupt or unsupported format)"
+                printf '::error::SSH_PRIVATE_KEY is unreadable: %s - GitHub SSH auth stays OFF.\n' "$KEY_REASON"
+              else
+                KEY_FP="$(printf '%s' "$KEY_FP_LINE" | awk '{print $2}')"
+                KEY_TYPE="$(printf '%s' "$KEY_FP_LINE" | awk '{print $NF}' | tr -d '()')"
+                case "$KEY_TYPE" in
+                  ED25519) KEY_NAME=id_ed25519 ;;
+                  RSA)     KEY_NAME=id_rsa ;;
+                  ECDSA)   KEY_NAME=id_ecdsa ;;
+                  *)       KEY_NAME="id_$(printf '%s' "$KEY_TYPE" | tr 'A-Z' 'a-z')" ;;
+                esac
+                mv -f "$STAGED" "$HOME/.ssh/$KEY_NAME"
+                chmod 600 "$HOME/.ssh/$KEY_NAME"
+                if ssh-keygen -y -P '' -f "$HOME/.ssh/$KEY_NAME" > "$HOME/.ssh/$KEY_NAME.pub" 2>/dev/null; then
+                  chmod 644 "$HOME/.ssh/$KEY_NAME.pub"; KEY_ENC=no
+                else
+                  rm -f "$HOME/.ssh/$KEY_NAME.pub"; KEY_ENC=yes
+                fi
+
+                # --- pin github.com host keys from GitHub's authoritative HTTPS endpoint
+                KH="$HOME/.ssh/known_hosts"
+                rm -f "$KH"
+                if curl -fsS --max-time 20 https://api.github.com/meta 2>/dev/null \
+                     | python3 -c 'import json,sys
+          sys.stdout.write("".join("github.com %s\n" % k for k in json.load(sys.stdin)["ssh_keys"]))' > "$KH" \
+                   && [ -s "$KH" ]; then
+                  HOST_KEYS_SRC="api.github.com/meta"
+                  if ssh-keygen -lf "$KH" 2>/dev/null \
+                       | grep -q 'SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU'; then
+                    printf 'github.com host keys pinned from api.github.com/meta (ed25519 fingerprint verified)\n'
+                  else
+                    printf '::warning::github.com ed25519 host key is NOT the well-known SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU - keys may have been rotated; re-verify before trusting this runner.\n'
+                  fi
+                else
+                  printf '::warning::Could not fetch github.com host keys from api.github.com/meta; falling back to ssh-keyscan (trust-on-first-use).\n'
+                  ssh-keyscan -T 10 -t ed25519,rsa,ecdsa github.com > "$KH" 2>/dev/null || true
+                  [ -s "$KH" ] && HOST_KEYS_SRC="ssh-keyscan (TOFU)"
+                fi
+                chmod 600 "$KH"
+
+                # Absolute paths: OpenSSH resolves `~` from the passwd database, not $HOME.
+                KEY_DISPLAY="~/.ssh/$KEY_NAME"
+                if [ -s "$KH" ]; then STRICT=yes; else STRICT=accept-new; fi
+                cat > "$HOME/.ssh/config" <<CFG
+          Host github.com
+            HostName github.com
+            User git
+            IdentitiesOnly yes
+            IdentityFile $HOME/.ssh/$KEY_NAME
+            UserKnownHostsFile $KH
+            StrictHostKeyChecking $STRICT
+            ServerAliveInterval 30
+          CFG
+                chmod 600 "$HOME/.ssh/config"
+
+                # --- prove THIS key works, with nothing ambient able to stand in for it
+                AUTH="$(ssh -F /dev/null -T -o BatchMode=yes -o ConnectTimeout=15 \
+                          -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no \
+                          -o IdentitiesOnly=yes -o "IdentityFile=$HOME/.ssh/$KEY_NAME" \
+                          -o "UserKnownHostsFile=$KH" -o "StrictHostKeyChecking=$STRICT" \
+                          git@github.com 2>&1 | tr -d '\r')"
+                LOGIN="$(printf '%s\n' "$AUTH" | sed -n 's/^Hi \([^!]\{1,\}\)!.*/\1/p' | head -1)"
+                if [ -z "$LOGIN" ]; then
+                  KEY_REASON="github.com refused the key: $(printf '%s' "$AUTH" | head -1)"
+                  [ "$KEY_ENC" = yes ] && KEY_REASON="the key is passphrase-protected, so it cannot be used non-interactively: strip the passphrase (ssh-keygen -p) or use a dedicated key"
+                  printf '::error::~/.ssh/%s installed but did not authenticate (not fatal). %s\n' "$KEY_NAME" "$KEY_REASON"
+                else
+                  KEY_READY=true
+                  KEY_REASON="authenticated as $LOGIN"
+                  printf '::notice::GitHub SSH key is live at ~/.ssh/%s - anyone who reaches this no-auth MCP endpoint can use it. Keep this key narrowly scoped and rotate it.\n' "$KEY_NAME"
+                  printf 'authenticated to github.com as %s (%s %s)\n' "$LOGIN" "$KEY_TYPE" "$KEY_FP"
+                  OWNER="${LOGIN%%/*}"
+                  if [ "$LOGIN" = "$OWNER" ]; then
+                    git config --global user.name  "$OWNER"
+                    git config --global user.email "${OWNER}@users.noreply.github.com"
+                    printf 'git commit identity: %s <%s@users.noreply.github.com>\n' "$OWNER" "$OWNER"
+                  else
+                    # A deploy key only grants this key access to ONE repository, so
+                    # rewriting every https GitHub URL would break unrelated clones.
+                    REWRITE_EFFECTIVE=false
+                    printf '::notice::Deploy key scoped to %s detected - https->ssh rewrite forced OFF so other repos keep working.\n' "$LOGIN"
+                  fi
+                  if [ "$REWRITE_EFFECTIVE" = "true" ]; then
+                    git config --global url."git@github.com:".insteadOf "https://github.com/"
+                    printf 'https://github.com/ remotes are rewritten to git@github.com: (SSH)\n'
+                  else
+                    printf 'https://github.com/ remotes are left alone (git_ssh_rewrite=%s)\n' "${REWRITE:-false}"
+                  fi
+                fi
+              fi
+            fi
+          fi
+
+          if [ "$KEY_READY" != "true" ]; then REWRITE_EFFECTIVE=false; fi
+
+          {
+            echo "SSH_KEY_READY=$KEY_READY"
+            echo "SSH_KEY_REASON=$KEY_REASON"
+            echo "SSH_LOGIN=${LOGIN:-}"
+            echo "SSH_KEY_NAME=$KEY_NAME"
+            echo "SSH_KEY_FINGERPRINT=$KEY_FP"
+            echo "SSH_KEY_TYPE=$KEY_TYPE"
+            echo "SSH_KEY_ENCRYPTED=$KEY_ENC"
+            echo "SSH_HOST_KEYS=$HOST_KEYS_SRC"
+            echo "SSH_REWRITE=$REWRITE_EFFECTIVE"
+          } >> "$GITHUB_ENV"
+
+          {
+            echo "### GitHub SSH auth"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| authenticated | **${KEY_READY}** |"
+            echo "| detail | ${KEY_REASON} |"
+            echo "| key file | \`${KEY_DISPLAY}\` |"
+            echo "| fingerprint | \`${KEY_FP:-n/a}\` |"
+            echo "| host keys | ${HOST_KEYS_SRC} |"
+            echo "| https -> ssh rewrite | ${REWRITE_EFFECTIVE} |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Start MCP server (--no-auth) and LinkPulse tunnel
         id: tunnel
@@ -110,7 +306,19 @@ jobs:
           export MY_PROXY_TOKEN="$LINKPULSE_TOKEN"
 
           # --- Remote-Shell-MCP, no auth ------------------------------------
-          git clone --depth 1 https://github.com/Avinash99b/Remote-Shell-MCP.git server
+          # Prefer SSH when the key above works (which also proves it end-to-end);
+          # fall back to anonymous HTTPS so a stale key can never cost you a run.
+          if [ "${SSH_KEY_READY:-false}" = "true" ] &&
+             git clone --depth 1 git@github.com:Avinash99b/Remote-Shell-MCP.git server 2>&1; then
+            echo "cloned Remote-Shell-MCP over SSH (git@github.com:)"
+          else
+            rm -rf server
+            echo "::notice::SSH clone unavailable - falling back to anonymous HTTPS"
+            # GIT_CONFIG_*=/dev/null neutralises the https->ssh rewrite, which would
+            # otherwise re-route this fallback straight back onto the broken SSH path.
+            GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+              git clone --depth 1 https://github.com/Avinash99b/Remote-Shell-MCP.git server
+          fi
           python3 -m venv .venv
           ./.venv/bin/pip install --quiet --disable-pip-version-check -r server/requirements.txt
 
@@ -190,6 +398,7 @@ jobs:
             echo "| Auth | **none** (\`--no-auth\`) |"
             echo "| Tunnel | LinkPulse ${LINKPULSE_VERSION} -> \`${SERVER}\` |"
             echo "| Subdomain | \`${SUB}\` |"
+            echo "| GitHub SSH | \`${SSH_LOGIN:-none}\` key-ready: \`${SSH_KEY_READY:-false}\` https->ssh: \`${SSH_REWRITE:-false}\` |"
             echo "| Runner | $(nproc) vCPU / $(free -g | awk '/Mem:/{print $2}') GB RAM |"
             echo "| Disk | $(df -h . | awk 'NR==2{print $2" total, "$4" free"}') |"
             echo "| JDK | $(java -version 2>&1 | head -1) |"

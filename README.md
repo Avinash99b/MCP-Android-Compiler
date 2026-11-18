@@ -26,12 +26,14 @@ Set these in **Settings → Secrets and variables → Actions**. Nothing secret 
 | `LINKPULSE_TOKEN` | **yes** | Shared secret of the LinkPulse control server |
 | `LINKPULSE_SERVER` | **yes** | Control server as `host:port`, e.g. `tunnel.example.com:9000`. The public domain is derived from the host part, so no hostname is committed here. |
 | `MACRODROID_WEBHOOK_URL` | no | MacroDroid trigger URL; receives the public URL when the runner is ready |
+| `SSH_PRIVATE_KEY` | no | **Unencrypted** OpenSSH/PEM private key. Written to the runner's `~/.ssh` so this workflow *and* the interactive shell authenticate to GitHub over SSH (`git@github.com:`). Needs no `contents: write` token scope. |
 
 ```bash
 # both are required; the token is never echoed
 gh secret set LINKPULSE_TOKEN  --repo Avinash99b/MCP-Android-Compiler
 gh secret set LINKPULSE_SERVER --repo Avinash99b/MCP-Android-Compiler   # paste host:port
 gh secret set MACRODROID_WEBHOOK_URL --repo Avinash99b/MCP-Android-Compiler   # optional
+gh secret set SSH_PRIVATE_KEY --repo Avinash99b/MCP-Android-Compiler < ~/.ssh/mcp_runner   # optional
 ```
 
 No hostname, URL, token or key is stored in this repository — only the `subdomain` label. The public
@@ -64,6 +66,8 @@ config does not change between runs.
    - `duration_minutes` — how long to keep the runner (max 350; GitHub kills hosted jobs at 360)
    - `subdomain` — default `mcp-android-compiler` → `https://mcp-android-compiler.<your-linkpulse-domain>`
    - `notify_phone` — push the URL to your phone
+   - `git_ssh_rewrite` — default `true`; rewrite `https://github.com/` remotes to `git@github.com:`
+     so every git command in the shell goes over SSH. Ignored when no key is installed.
 2. The workflow verifies the **public** endpoint with a real MCP `initialize` before declaring
    success, then idles.
 3. Point your MCP client at it.
@@ -102,8 +106,58 @@ curl -sS -X POST https://mcp-android-compiler.<your-linkpulse-domain>/mcp \
 Commands run as **background jobs**, so a long Gradle build survives client disconnects — start it,
 close the laptop, poll `get_job` later.
 
-> `git_push` will not work as written: the workflow sets `permissions: {}`. Add `contents: write`
-> to the workflow if you want the runner to push.
+> **`git_push` and `git clone` now work without any token scope** when `SSH_PRIVATE_KEY` is set:
+> the runner authenticates over SSH, and `permissions: {}` still means the shell never holds a
+> GitHub *token*. If you would rather push with a token instead, add `contents: write` to the
+> workflow and the `GITHUB_TOKEN` becomes usable - but then the no-auth shell holds that too.
+
+## GitHub credentials inside the shell (SSH)
+
+Set `SSH_PRIVATE_KEY` and the workflow step **Install GitHub SSH key (optional)** runs before
+anything else touches the network:
+
+1. normalises the secret (single-line values with literal `\n`, CRLF, or stray quotes all work);
+2. names the file after the key type it detects — `~/.ssh/id_ed25519`, `id_rsa` or `id_ecdsa`, mode `600`;
+3. pins `github.com` host keys from `https://api.github.com/meta` and checks the well-known ED25519
+   fingerprint (`SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU`), falling back to `ssh-keyscan`
+   with a warning if the fetch fails — never blind trust-on-first-use;
+4. writes `~/.ssh/config` with `IdentitiesOnly yes` and absolute paths, because OpenSSH resolves `~`
+   from the passwd database and not from `$HOME`;
+5. proves the key with a real `ssh -T git@github.com` — pinned to *that* key via
+   `-F /dev/null -o IdentitiesOnly=yes -i <key>`, so no ambient key can vouch for it;
+6. sets `git config --global user.name/user.email` to the authenticated account, so `git commit`
+   works in the shell without "Author identity unknown".
+
+The result is reported in the job summary: authenticated account, key type, fingerprint, host-key
+source, and whether the rewrite is active.
+
+Make a dedicated key (don't ship your laptop's primary identity to an unauthenticated runner):
+
+```bash
+ssh-keygen -t ed25519 -C "mcp-android-compiler" -f ~/.ssh/mcp_runner -N ''
+# add ~/.ssh/mcp_runner.pub  -> GitHub Settings > SSH keys
+# or, safer: repo Settings > Deploy keys (tick "Allow write access")
+gh secret set SSH_PRIVATE_KEY < ~/.ssh/mcp_runner
+```
+
+Then, from inside the shell:
+
+```bash
+git clone git@github.com:Avinash99b/SomeRepo.git   # works as-is via ~/.ssh/config
+cd SomeRepo && git commit -am "..." && git push     # commits get the right identity
+```
+
+Notes and failure modes:
+
+- **Never fatal.** No key, a `.pub` pasted by mistake, a corrupt blob or a rejected key all log a
+  warning/error annotation and continue over HTTPS. The summary says `authenticated: false` with the reason.
+- **Passphrase-protected keys are refused by design** — a hosted runner has nowhere to type the
+  passphrase. The step says so explicitly instead of hanging. Strip it with `ssh-keygen -p`.
+- A **deploy key** is detected from the `Hi OWNER/REPO!` banner; because it only grants access to one
+  repository, the https→ssh rewrite is forced **off** automatically so unrelated clones keep working.
+- The workflow's own clone of `Remote-Shell-MCP` tries SSH first (proving the key end-to-end) and
+  falls back to anonymous HTTPS with `GIT_CONFIG_GLOBAL=/dev/null`, which neutralises the rewrite so
+  the fallback cannot be re-routed back onto the broken SSH path.
 
 ## Subdomain notes
 
@@ -197,6 +251,10 @@ convenience, not an oversight. Consequences to accept:
 - The URL is stable across runs, so it does not need to be *discovered* — only guessed/known.
 - Mitigations that remain: `permissions: {}` (the shell holds no GitHub token), loopback-only bind,
   `--allowed-host` Host-header allowlist, 355-minute self-destruct, one-run concurrency.
+- **If `SSH_PRIVATE_KEY` is set, the shell also holds a GitHub SSH identity.** Anyone reaching the
+  URL can `git push` as that key. That is why the key should be dedicated (deploy key or a
+  throwaway account), narrowly scoped, and rotated after use — the token-less `permissions: {}`
+  guarantee does not cover it.
 - Stop the runner when you are done (**Actions → Cancel workflow**); the URL 404s as soon as the
   client disconnects.
 
