@@ -99,9 +99,17 @@ jobs:
           # Installs the GitHub SSH private key (repo secret SSH_PRIVATE_KEY) into the
           # runner's ~/.ssh, so this workflow's own clones AND the whole MCP shell session
           # can talk to GitHub over SSH - no PAT, no `contents: write` token scope.
-          # Never fatal: a missing/broken key degrades to HTTPS-only instead of costing a run.
+          #
+          # Never fatal by design: a missing/broken key degrades to HTTPS-only instead of
+          # costing a run. That is why errexit is cleared explicitly below - see the note.
           # ---------------------------------------------------------------------------
-          set -uo pipefail
+
+          # GitHub runs a `run:` step as  bash --noprofile --norc -eo pipefail step.sh ,
+          # and -e inherited from the command line is NOT cancelled by a later `set -u`:
+          # it has to be turned off explicitly. (First version of this step shipped without
+          # this line and died at `AUTH="$(ssh -T git@github.com)"`, because ssh -T exits 1
+          # even on SUCCESSFUL auth - GitHub returns non-zero since it grants no shell.)
+          set +e -uo pipefail
 
           KEY_READY=false
           KEY_REASON="SSH_PRIVATE_KEY is not set (optional secret)"
@@ -144,14 +152,14 @@ jobs:
             else
               # OpenSSH-format keys embed their public half, so -lf works even for a
               # passphrase-protected key; `-y -P ''` does not, and is how we detect one.
-              KEY_FP_LINE="$(ssh-keygen -lf "$STAGED" 2>/dev/null)"
+              KEY_FP_LINE="$(ssh-keygen -lf "$STAGED" 2>/dev/null)" || KEY_FP_LINE=""
               if [ -z "$KEY_FP_LINE" ]; then
                 rm -f "$STAGED"
                 KEY_REASON="ssh-keygen could not parse the key (corrupt or unsupported format)"
                 printf '::error::SSH_PRIVATE_KEY is unreadable: %s - GitHub SSH auth stays OFF.\n' "$KEY_REASON"
               else
-                KEY_FP="$(printf '%s' "$KEY_FP_LINE" | awk '{print $2}')"
-                KEY_TYPE="$(printf '%s' "$KEY_FP_LINE" | awk '{print $NF}' | tr -d '()')"
+                KEY_FP="$(printf '%s' "$KEY_FP_LINE" | awk '{print $2}')" || KEY_FP=""
+                KEY_TYPE="$(printf '%s' "$KEY_FP_LINE" | awk '{print $NF}' | tr -d '()')" || KEY_TYPE=""
                 case "$KEY_TYPE" in
                   ED25519) KEY_NAME=id_ed25519 ;;
                   RSA)     KEY_NAME=id_rsa ;;
@@ -171,7 +179,11 @@ jobs:
                 rm -f "$KH"
                 if curl -fsS --max-time 20 https://api.github.com/meta 2>/dev/null \
                      | python3 -c 'import json,sys
-          sys.stdout.write("".join("github.com %s\n" % k for k in json.load(sys.stdin)["ssh_keys"]))' > "$KH" \
+          try:
+              keys = json.load(sys.stdin)["ssh_keys"]
+          except Exception:
+              sys.exit(1)          # empty/garbage body: let the ssh-keyscan fallback run quietly
+          sys.stdout.write("".join("github.com %s\n" % k for k in keys))' > "$KH" \
                    && [ -s "$KH" ]; then
                   HOST_KEYS_SRC="api.github.com/meta"
                   if ssh-keygen -lf "$KH" 2>/dev/null \
@@ -183,9 +195,9 @@ jobs:
                 else
                   printf '::warning::Could not fetch github.com host keys from api.github.com/meta; falling back to ssh-keyscan (trust-on-first-use).\n'
                   ssh-keyscan -T 10 -t ed25519,rsa,ecdsa github.com > "$KH" 2>/dev/null || true
-                  [ -s "$KH" ] && HOST_KEYS_SRC="ssh-keyscan (TOFU)"
+                  { [ -s "$KH" ] && HOST_KEYS_SRC="ssh-keyscan (TOFU)"; } || true
                 fi
-                chmod 600 "$KH"
+                chmod 600 "$KH" 2>/dev/null || true
 
                 # Absolute paths: OpenSSH resolves `~` from the passwd database, not $HOME.
                 KEY_DISPLAY="~/.ssh/$KEY_NAME"
@@ -200,15 +212,17 @@ jobs:
             StrictHostKeyChecking $STRICT
             ServerAliveInterval 30
           CFG
-                chmod 600 "$HOME/.ssh/config"
+                chmod 600 "$HOME/.ssh/config" 2>/dev/null || true
 
                 # --- prove THIS key works, with nothing ambient able to stand in for it
+                # `|| true` is load-bearing twice over: ssh -T exits 1 on success, and
+                # pipefail would otherwise surface a SIGPIPE from `head` below.
                 AUTH="$(ssh -F /dev/null -T -o BatchMode=yes -o ConnectTimeout=15 \
                           -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no \
                           -o IdentitiesOnly=yes -o "IdentityFile=$HOME/.ssh/$KEY_NAME" \
                           -o "UserKnownHostsFile=$KH" -o "StrictHostKeyChecking=$STRICT" \
-                          git@github.com 2>&1 | tr -d '\r')"
-                LOGIN="$(printf '%s\n' "$AUTH" | sed -n 's/^Hi \([^!]\{1,\}\)!.*/\1/p' | head -1)"
+                          git@github.com 2>&1 | tr -d '\r')" || true
+                LOGIN="$(printf '%s\n' "$AUTH" | sed -n 's/^Hi \([^!]\{1,\}\)!.*/\1/p' | head -1)" || LOGIN=""
                 if [ -z "$LOGIN" ]; then
                   KEY_REASON="github.com refused the key: $(printf '%s' "$AUTH" | head -1)"
                   [ "$KEY_ENC" = yes ] && KEY_REASON="the key is passphrase-protected, so it cannot be used non-interactively: strip the passphrase (ssh-keygen -p) or use a dedicated key"
@@ -220,9 +234,8 @@ jobs:
                   printf 'authenticated to github.com as %s (%s %s)\n' "$LOGIN" "$KEY_TYPE" "$KEY_FP"
                   OWNER="${LOGIN%%/*}"
                   if [ "$LOGIN" = "$OWNER" ]; then
-                    git config --global user.name  "$OWNER"
-                    git config --global user.email "${OWNER}@users.noreply.github.com"
-                    printf 'git commit identity: %s <%s@users.noreply.github.com>\n' "$OWNER" "$OWNER"
+                    git config --global user.name  "$OWNER" && git config --global user.email "${OWNER}@users.noreply.github.com" && \
+                      printf 'git commit identity: %s <%s@users.noreply.github.com>\n' "$OWNER" "$OWNER"
                   else
                     # A deploy key only grants this key access to ONE repository, so
                     # rewriting every https GitHub URL would break unrelated clones.
@@ -230,8 +243,8 @@ jobs:
                     printf '::notice::Deploy key scoped to %s detected - https->ssh rewrite forced OFF so other repos keep working.\n' "$LOGIN"
                   fi
                   if [ "$REWRITE_EFFECTIVE" = "true" ]; then
-                    git config --global url."git@github.com:".insteadOf "https://github.com/"
-                    printf 'https://github.com/ remotes are rewritten to git@github.com: (SSH)\n'
+                    git config --global url."git@github.com:".insteadOf "https://github.com/" && \
+                      printf 'https://github.com/ remotes are rewritten to git@github.com: (SSH)\n'
                   else
                     printf 'https://github.com/ remotes are left alone (git_ssh_rewrite=%s)\n' "${REWRITE:-false}"
                   fi
@@ -267,6 +280,8 @@ jobs:
             echo "| https -> ssh rewrite | ${REWRITE_EFFECTIVE} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
+          # Non-fatal by design: never fail the job on a credential problem.
+          exit 0
       - name: Start MCP server (--no-auth) and LinkPulse tunnel
         id: tunnel
         env:

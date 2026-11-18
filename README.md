@@ -151,6 +151,12 @@ Notes and failure modes:
 
 - **Never fatal.** No key, a `.pub` pasted by mistake, a corrupt blob or a rejected key all log a
   warning/error annotation and continue over HTTPS. The summary says `authenticated: false` with the reason.
+- **The step clears errexit deliberately** (`set +e`). GitHub runs `run:` scripts as
+  `bash --noprofile --norc -eo pipefail`, and `-e` inherited from the command line is *not*
+  cancelled by a later `set -u`. The first version of this step omitted that line and failed the
+  job at `AUTH="$(ssh -T git@github.com)"` — because **`ssh -T` exits 1 even when it
+  authenticates successfully** (GitHub returns non-zero since it grants no shell). If you edit
+  this step, test it as `bash -eo pipefail`, not plain `bash`.
 - **Passphrase-protected keys are refused by design** — a hosted runner has nowhere to type the
   passphrase. The step says so explicitly instead of hanging. Strip it with `ssh-keygen -p`.
 - A **deploy key** is detected from the `Hi OWNER/REPO!` banner; because it only grants access to one
